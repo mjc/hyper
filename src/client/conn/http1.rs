@@ -136,6 +136,7 @@ pub struct Builder {
     #[cfg(feature = "ffi")]
     h1_preserve_header_order: bool,
     h1_read_buf_exact_size: Option<usize>,
+    h1_read_buf_chunk_size: Option<usize>,
     h1_max_buf_size: Option<usize>,
 }
 
@@ -350,6 +351,7 @@ impl Builder {
             h09_responses: false,
             h1_writev: None,
             h1_read_buf_exact_size: None,
+            h1_read_buf_chunk_size: None,
             h1_parser_config: ParserConfig::default(),
             h1_title_case_headers: false,
             h1_preserve_header_case: false,
@@ -444,11 +446,11 @@ impl Builder {
     }
 
     /// Set whether HTTP/1 connections should try to use vectored writes,
-    /// or always flatten into a single buffer.
+    /// or write queued buffers with ordinary scalar writes.
     ///
-    /// Note that setting this to false may mean more copies of body data,
-    /// but may also improve performance when an IO transport doesn't
-    /// support vectored writes well, such as most TLS implementations.
+    /// Setting this to false keeps the body's buffers without copying them
+    /// into the header buffer. Headers and body chunks may require separate
+    /// writes.
     ///
     /// Setting this to true will force hyper to use queued strategy,
     /// which may eliminate unnecessary cloning on some TLS backends.
@@ -538,7 +540,20 @@ impl Builder {
     /// Default is an adaptive read buffer.
     pub fn read_buf_exact_size(&mut self, sz: Option<usize>) -> &mut Builder {
         self.h1_read_buf_exact_size = sz;
+        self.h1_read_buf_chunk_size = None;
         self.h1_max_buf_size = None;
+        self
+    }
+
+    /// Set the maximum number of bytes read into the HTTP/1 buffer per I/O call.
+    ///
+    /// Unlike `read_buf_exact_size`, this keeps the configured maximum header
+    /// buffer size. The buffer can grow when a message header spans multiple
+    /// reads, but body reads remain bounded to this chunk size.
+    pub fn read_buf_chunk_size(&mut self, sz: usize) -> &mut Builder {
+        assert!(sz > 0, "the read buffer chunk size must be positive.");
+        self.h1_read_buf_chunk_size = Some(sz);
+        self.h1_read_buf_exact_size = None;
         self
     }
 
@@ -593,7 +608,7 @@ impl Builder {
                 if writev {
                     conn.set_write_strategy_queue();
                 } else {
-                    conn.set_write_strategy_flatten();
+                    conn.set_write_strategy_queue_scalar();
                 }
             }
             if opts.h1_title_case_headers {
@@ -622,6 +637,13 @@ impl Builder {
             }
             if let Some(max) = opts.h1_max_buf_size {
                 conn.set_max_buf_size(max);
+            }
+            if let Some(sz) = opts.h1_read_buf_chunk_size {
+                conn.set_read_buf_chunk_size(
+                    sz,
+                    opts.h1_max_buf_size
+                        .unwrap_or(proto::h1::DEFAULT_MAX_BUFFER_SIZE),
+                );
             }
             let cd = proto::h1::dispatch::Client::new(rx);
             let proto = proto::h1::Dispatcher::new(cd, conn);

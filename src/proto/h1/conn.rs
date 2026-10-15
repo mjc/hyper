@@ -103,6 +103,10 @@ where
         self.io.set_write_strategy_queue();
     }
 
+    pub(crate) fn set_write_strategy_queue_scalar(&mut self) {
+        self.io.set_write_strategy_queue_scalar();
+    }
+
     pub(crate) fn set_max_buf_size(&mut self, max: usize) {
         self.io.set_max_buf_size(max);
     }
@@ -112,8 +116,9 @@ where
         self.io.set_read_buf_exact_size(sz);
     }
 
-    pub(crate) fn set_write_strategy_flatten(&mut self) {
-        self.io.set_write_strategy_flatten();
+    #[cfg(feature = "client")]
+    pub(crate) fn set_read_buf_chunk_size(&mut self, sz: usize, max: usize) {
+        self.io.set_read_buf_chunk_size(sz, max);
     }
 
     pub(crate) fn set_h1_parser_config(&mut self, parser_config: ParserConfig) {
