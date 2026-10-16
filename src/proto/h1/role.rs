@@ -11,7 +11,7 @@ use http::header::Entry;
 use http::header::ValueIter;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode, Version};
-use smallvec::{smallvec, smallvec_inline, SmallVec};
+use smallvec::{SmallVec, smallvec, smallvec_inline};
 
 use crate::body::DecodedLength;
 #[cfg(feature = "server")]
@@ -21,11 +21,11 @@ use crate::ext::HeaderCaseMap;
 #[cfg(feature = "ffi")]
 use crate::ext::OriginalHeaderOrder;
 use crate::headers;
+#[cfg(feature = "client")]
+use crate::proto::RequestHead;
 use crate::proto::h1::{
     Encode, Encoder, Http1Transaction, ParseContext, ParseResult, ParsedMessage,
 };
-#[cfg(feature = "client")]
-use crate::proto::RequestHead;
 use crate::proto::{BodyLength, MessageHead, RequestLine};
 
 pub(crate) const DEFAULT_MAX_HEADERS: usize = 100;
@@ -216,7 +216,7 @@ impl Http1Transaction for Server {
                             debug_assert!(req.path.is_none());
                             Parse::Uri
                         }
-                    })
+                    });
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -260,7 +260,10 @@ impl Http1Transaction for Server {
             None
         };
 
-        let mut headers = ctx.cached_headers.take().unwrap_or_default();
+        let mut headers = ctx
+            .cached_headers
+            .take()
+            .unwrap_or_else(super::pool::take_headers);
         let mut saw_connection_close = false;
 
         headers.reserve(headers_len);
@@ -390,9 +393,7 @@ impl Http1Transaction for Server {
     fn encode(mut msg: Encode<'_, Self::Outgoing>, dst: &mut Vec<u8>) -> crate::Result<Encoder> {
         trace!(
             "Server::encode status={:?}, body={:?}, req_method={:?}",
-            msg.head.subject,
-            msg.body,
-            msg.req_method
+            msg.head.subject, msg.body, msg.req_method
         );
 
         let mut wrote_len = false;
@@ -732,9 +733,9 @@ impl Server {
                                 if let Some(len) = headers::content_length_parse(&value) {
                                     if msg.req_method != &Some(Method::HEAD) || known_len != 0 {
                                         assert!(
-                                        len == known_len,
-                                        "payload claims content-length of {known_len}, custom content-length header claims {len}",
-                                    );
+                                            len == known_len,
+                                            "payload claims content-length of {known_len}, custom content-length header claims {len}",
+                                        );
                                     }
                                 }
                             }
@@ -974,8 +975,7 @@ impl Server {
         if !Server::can_have_body(msg.req_method.as_ref(), msg.head.subject) {
             trace!(
                 "server body forced to 0; method={:?}, status={:?}",
-                msg.req_method,
-                msg.head.subject
+                msg.req_method, msg.head.subject
             );
             encoder = Encoder::length(0);
         }
@@ -1215,8 +1215,7 @@ impl Http1Transaction for Client {
     fn encode(msg: Encode<'_, Self::Outgoing>, dst: &mut Vec<u8>) -> crate::Result<Encoder> {
         trace!(
             "Client::encode method={:?}, body={:?}",
-            msg.head.subject.0,
-            msg.body
+            msg.head.subject.0, msg.body
         );
 
         *msg.req_method = Some(msg.head.subject.0.clone());
@@ -2240,24 +2239,26 @@ mod tests {
 
         fn parse_ignores(s: &str) {
             let mut bytes = BytesMut::from(s);
-            assert!(Client::parse(
-                &mut bytes,
-                ParseContext {
-                    cached_headers: &mut None,
-                    req_method: &mut Some(Method::GET),
-                    h1_parser_config: Default::default(),
-                    h1_max_headers: None,
-                    h1_max_header_size: None,
-                    preserve_header_case: false,
-                    #[cfg(feature = "ffi")]
-                    preserve_header_order: false,
-                    h09_responses: false,
-                    #[cfg(feature = "client")]
-                    on_informational: &mut None,
-                }
+            assert!(
+                Client::parse(
+                    &mut bytes,
+                    ParseContext {
+                        cached_headers: &mut None,
+                        req_method: &mut Some(Method::GET),
+                        h1_parser_config: Default::default(),
+                        h1_max_headers: None,
+                        h1_max_header_size: None,
+                        preserve_header_case: false,
+                        #[cfg(feature = "ffi")]
+                        preserve_header_order: false,
+                        h09_responses: false,
+                        #[cfg(feature = "client")]
+                        on_informational: &mut None,
+                    }
+                )
+                .expect("parse ok")
+                .is_none()
             )
-            .expect("parse ok")
-            .is_none())
         }
 
         fn parse_with_method(s: &str, m: Method) -> ParsedMessage<StatusCode> {
@@ -2887,7 +2888,7 @@ mod tests {
     #[test]
     fn test_client_request_encode_orig_case() {
         use crate::proto::BodyLength;
-        use http::header::{HeaderValue, CONTENT_LENGTH};
+        use http::header::{CONTENT_LENGTH, HeaderValue};
 
         let mut head = MessageHead::default();
         head.headers
@@ -2924,7 +2925,7 @@ mod tests {
     #[test]
     fn test_client_request_encode_orig_and_title_case() {
         use crate::proto::BodyLength;
-        use http::header::{HeaderValue, CONTENT_LENGTH};
+        use http::header::{CONTENT_LENGTH, HeaderValue};
 
         let mut head = MessageHead::default();
         head.headers
@@ -3019,7 +3020,7 @@ mod tests {
     #[test]
     fn test_server_response_encode_orig_case() {
         use crate::proto::BodyLength;
-        use http::header::{HeaderValue, CONTENT_LENGTH};
+        use http::header::{CONTENT_LENGTH, HeaderValue};
 
         let mut head = MessageHead::default();
         head.headers
@@ -3055,7 +3056,7 @@ mod tests {
     #[test]
     fn test_server_response_encode_orig_and_title_case() {
         use crate::proto::BodyLength;
-        use http::header::{HeaderValue, CONTENT_LENGTH};
+        use http::header::{CONTENT_LENGTH, HeaderValue};
 
         let mut head = MessageHead::default();
         head.headers
@@ -3092,7 +3093,7 @@ mod tests {
     #[test]
     fn test_disabled_date_header() {
         use crate::proto::BodyLength;
-        use http::header::{HeaderValue, CONTENT_LENGTH};
+        use http::header::{CONTENT_LENGTH, HeaderValue};
 
         let mut head = MessageHead::default();
         head.headers

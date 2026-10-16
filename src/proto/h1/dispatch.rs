@@ -37,7 +37,7 @@ pub(crate) trait Dispatch {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), Self::PollError>>>;
     fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, IncomingBody)>)
-        -> crate::Result<()>;
+    -> crate::Result<()>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>>;
     fn should_poll(&self) -> bool;
 }
@@ -99,6 +99,11 @@ where
         }
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn io_mut(&mut self) -> &mut I {
+        self.conn.io_mut()
+    }
+
     pub(crate) fn into_inner(self) -> (I, Bytes, D) {
         let (io, buf) = self.conn.into_inner();
         (io, buf, self.dispatch)
@@ -118,6 +123,28 @@ where
                 pending.manual();
             }
         })
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn poll_until_idle(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<bool>> {
+        match self.poll_catch(cx, false) {
+            Poll::Ready(result) => Poll::Ready(result.map(|done| {
+                if let Dispatched::Upgrade(pending) = done {
+                    pending.manual();
+                }
+                false
+            })),
+            Poll::Pending
+                if !self.is_closing
+                    && self.conn.can_park()
+                    && self.body_tx.0.is_none()
+                    && self.body_rx.is_none()
+                    && !self.dispatch.should_poll() =>
+            {
+                Poll::Ready(Ok(true))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_catch(

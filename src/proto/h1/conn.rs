@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 use futures_core::ready;
-use http::header::{Entry, HeaderValue, CONNECTION};
+use http::header::{CONNECTION, Entry, HeaderValue};
 use http::{HeaderMap, Method, Version};
 use http_body::Frame;
 use httparse::ParserConfig;
@@ -47,11 +47,17 @@ where
     B: Buf,
     T: Http1Transaction,
 {
+    #[cfg(feature = "server")]
+    pub(crate) fn io_mut(&mut self) -> &mut I {
+        self.io.io_mut()
+    }
+
     pub(crate) fn new(io: I) -> Conn<I, B, T> {
         Conn {
             io: Buffered::new(io),
             state: State {
                 allow_half_close: false,
+                #[cfg(feature = "client")]
                 cached_headers: None,
                 error: None,
                 keep_alive: KA::Busy,
@@ -182,6 +188,14 @@ where
         self.state.is_write_closed()
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn can_park(&self) -> bool {
+        self.state.is_idle()
+            && !self.is_mid_message()
+            && self.io.read_buf().is_empty()
+            && !self.io.has_buffered_write()
+    }
+
     pub(crate) fn can_read_head(&self) -> bool {
         if !matches!(self.state.reading, Reading::Init) {
             return false;
@@ -244,10 +258,16 @@ where
             }
         }
 
+        // Server header maps live in the shared pool, not each connection.
+        #[cfg(not(feature = "client"))]
+        let mut cached_headers = None;
         let msg = match self.io.parse::<T>(
             cx,
             ParseContext {
+                #[cfg(feature = "client")]
                 cached_headers: &mut self.state.cached_headers,
+                #[cfg(not(feature = "client"))]
+                cached_headers: &mut cached_headers,
                 req_method: &mut self.state.method,
                 h1_parser_config: self.state.h1_parser_config.clone(),
                 h1_max_headers: self.state.h1_max_headers,
@@ -533,7 +553,7 @@ where
 
         match self.state.reading {
             Reading::Continue(..) | Reading::Body(..) | Reading::KeepAlive | Reading::Closed => {
-                return
+                return;
             }
             Reading::Init => (),
         }
@@ -653,9 +673,16 @@ where
             buf,
         ) {
             Ok(encoder) => {
-                debug_assert!(self.state.cached_headers.is_none());
                 debug_assert!(head.headers.is_empty());
-                self.state.cached_headers = Some(head.headers);
+                if T::is_server() {
+                    super::pool::recycle_headers(head.headers);
+                } else {
+                    #[cfg(feature = "client")]
+                    {
+                        debug_assert!(self.state.cached_headers.is_none());
+                        self.state.cached_headers = Some(head.headers);
+                    }
+                }
 
                 #[cfg(feature = "client")]
                 {
@@ -846,6 +873,7 @@ where
             if let Some(msg) = T::on_error(&err) {
                 // Drop the cached headers so as to not trigger a debug
                 // assert in `write_head`...
+                #[cfg(feature = "client")]
                 self.state.cached_headers.take();
                 self.write_head(msg, None);
                 self.state.error = Some(err);
@@ -944,6 +972,7 @@ impl<I: Unpin, B, T> Unpin for Conn<I, B, T> {}
 struct State {
     allow_half_close: bool,
     /// Re-usable `HeaderMap` to reduce allocating new ones.
+    #[cfg(feature = "client")]
     cached_headers: Option<HeaderMap>,
     /// If an error occurs when there wasn't a direct way to return it
     /// back to the user, this is set.
@@ -1147,7 +1176,6 @@ impl State {
 
         self.reading = Reading::Init;
         self.writing = Writing::Init;
-
         // !T::should_read_first() means Client.
         //
         // If Client connection has just gone idle, the Dispatcher
@@ -1187,6 +1215,29 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server")]
+    #[test]
+    fn server_response_releases_cached_headers_before_idle() {
+        use super::*;
+        use crate::common::io::Compat;
+        let io = Compat(tokio_test::io::Builder::new().build());
+        let mut conn = Conn::<_, bytes::Bytes, crate::proto::h1::ServerTransaction>::new(io);
+        let head = MessageHead {
+            version: Version::HTTP_11,
+            subject: http::StatusCode::OK,
+            headers: HeaderMap::with_capacity(16),
+            extensions: http::Extensions::new(),
+        };
+        conn.write_head(head, None);
+        #[cfg(feature = "client")]
+        assert!(conn.state.cached_headers.is_none());
+        conn.state.reading = Reading::KeepAlive;
+        conn.state.writing = Writing::KeepAlive;
+        conn.state
+            .try_keep_alive::<crate::proto::h1::ServerTransaction>();
+        assert!(conn.state.is_idle());
+    }
+
     #[cfg(all(feature = "nightly", not(miri)))]
     #[bench]
     fn bench_read_head_short(b: &mut ::test::Bencher) {
@@ -1200,7 +1251,7 @@ mod tests {
         let io = Compat(tokio_test::io::Builder::new().build());
         let mut conn = Conn::<_, bytes::Bytes, crate::proto::h1::ServerTransaction>::new(io);
         *conn.io.read_buf_mut() = ::bytes::BytesMut::from(&s[..]);
-        conn.state.cached_headers = Some(HeaderMap::with_capacity(2));
+        super::super::pool::recycle_headers(HeaderMap::with_capacity(2));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1214,7 +1265,7 @@ mod tests {
                         ::test::black_box(&x);
                         let mut headers = x.0.headers;
                         headers.clear();
-                        conn.state.cached_headers = Some(headers);
+                        super::super::pool::recycle_headers(headers);
                     }
                     f => panic!("expected Ready(Some(Ok(..))): {:?}", f),
                 }
@@ -1291,12 +1342,12 @@ mod tests {
 
     use super::*;
     use crate::common::io::Compat;
+    #[cfg(feature = "server")]
+    use crate::proto::RequestLine;
     #[cfg(feature = "client")]
     use crate::proto::h1::ClientTransaction;
     #[cfg(feature = "server")]
     use crate::proto::h1::ServerTransaction;
-    #[cfg(feature = "server")]
-    use crate::proto::RequestLine;
     use bytes::Bytes;
 
     fn poll_head<I, T>(

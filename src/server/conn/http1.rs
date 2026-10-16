@@ -143,9 +143,9 @@ where
     /// Return the inner IO object, and additional information.
     ///
     /// If the IO object has been "rewound" the io will not contain those bytes rewound.
-    /// This should only be called after `poll_without_shutdown` signals
-    /// that the connection is "done". Otherwise, it may not have finished
-    /// flushing all necessary HTTP bytes.
+    /// Call this after `poll_without_shutdown` signals completion or
+    /// `poll_until_idle` returns `Ok(true)`. Otherwise, the connection may not
+    /// have finished flushing all necessary HTTP bytes.
     ///
     /// # Panics
     /// This method will panic if this connection is using an h2 protocol.
@@ -173,6 +173,23 @@ where
         self.conn.poll_without_shutdown(cx)
     }
 
+    /// Drive HTTP until it closes (`false`) or reaches an idle keep-alive
+    /// boundary (`true`), without shutting down the transport.
+    ///
+    /// An idle result has no partial/pipelined input, pending request body,
+    /// handler future, response body, or buffered output. The caller may use
+    /// `into_parts` and later start a new HTTP connection on the same transport.
+    /// The returned service preserves its state between those sessions.
+    pub fn poll_until_idle(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<bool>> {
+        self.conn.poll_until_idle(cx)
+    }
+
+    /// Borrow the transport while preserving HTTP buffers and protocol state.
+    /// Direct reads or writes can desynchronize those buffers.
+    pub fn io_mut(&mut self) -> &mut I {
+        self.conn.io_mut()
+    }
+
     /// Prevent shutdown of the underlying IO object at the end of service the request,
     /// instead run `into_parts`. This is a convenience wrapper over `poll_without_shutdown`.
     ///
@@ -183,11 +200,12 @@ where
     pub fn without_shutdown(self) -> impl Future<Output = crate::Result<Parts<I, S>>> {
         let mut zelf = Some(self);
         crate::common::future::poll_fn(move |cx| {
-            ready!(zelf
-                .as_mut()
-                .expect("server connection polled after completion")
-                .conn
-                .poll_without_shutdown(cx))?;
+            ready!(
+                zelf.as_mut()
+                    .expect("server connection polled after completion")
+                    .conn
+                    .poll_without_shutdown(cx)
+            )?;
             Poll::Ready(Ok(zelf
                 .take()
                 .expect("server connection missing before completion")
